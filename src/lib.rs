@@ -91,17 +91,75 @@ pub mod AudioToolbox {
     /// When an AudioNode is added to the AudioGraph, a corresponding MapNode is created and added to the node tree
     struct MapNode {
         parent: Option<usize>,
-        children: Vec<usize>
+        children: Vec<usize>,
     }
 
     impl MapNode {
         fn new() -> MapNode {
             MapNode {
                 parent: None,
-                children: vec![]
+                children: vec![],
             }
         }
     }
+
+    /// An iterator for traversing the audio graph when calling process_block
+    /// Traversal is depth-first
+    /// An instance of TreeIterator is created for every NodeTree.  As a node gets added, it should push back an element onto the stack
+    /// This way, we avoid having to do dynamic memory allocations in the AudioGraph::process_block() call
+    /// 
+    /// Before traversing the graph, init() must be called before next() is called
+    /// The stack stores a tuple containing the id of the next node, the number of children that node has and an index value pointing to which child has been accounted for
+    // struct TreeIterator {
+    //     stack: Vec<(usize, usize, usize)>,
+    //     stack_size: usize
+    // }
+
+    // impl TreeIterator {
+
+    //     /// Initialize the iterator with the root node id.  init() will do a first pass traversal and place nodes to visit in the stack
+    //     fn init(&mut self, tree: &NodeTree) {
+    //         self.go_to_branch_end(tree, 0);
+    //     }
+
+    //     /// For a given node, go to the end of its branch and push the intermediate nodes onto the stack
+    //     fn go_to_branch_end(&mut self, tree: &NodeTree, node_id: usize) {
+    //         let mut current_id = node_id;
+    //         loop {
+    //             self.stack[self.stack_size] = (current_id, tree.nodes[current_id].children.len(), 0);
+    //             self.stack_size += 1;
+
+    //             if tree.nodes[current_id].children.len() > 0 {
+    //                 current_id = tree.nodes[current_id].children[0];
+    //             } else {
+    //                 break;
+    //             }
+    //         }
+    //     }
+
+    //     /// Retrieve the next node id in the audio graph chain.  Will return None if the entire graph has been processed
+    //     fn next(&mut self, tree: &NodeTree) -> Option<usize> {
+    //         if self.stack_size > 0 {
+    //             //  First, check to see if there are any unvisited children nodes in the current node
+    //             //  If there are, then traverse to the end of the branch and push the nodes along the way onto the stack
+    //             let (node_id, num_children, child_index) = self.stack[self.stack_size - 1];
+    //             if child_index + 1 < num_children {
+    //                 //  Mark child as visited
+    //                 self.stack[self.stack_size].2 = child_index + 1;
+
+    //                 let child_node_id = tree.nodes[node_id].children[child_index + 1];
+    //                 self.go_to_branch_end(tree, child_node_id);
+    //             }
+
+    //             let next_node_id = self.stack[self.stack_size - 1].0;
+    //             self.stack_size -= 1;
+
+    //             return Some(next_node_id);
+    //         }
+            
+    //         None
+    //     }
+    // }
 
 
 
@@ -109,30 +167,34 @@ pub mod AudioToolbox {
     /// An audio graph is responsible for creating and modifying audio samples that eventually are written to some output buffer
     /// Sample creation and modification is handled by the individual nodes 
     /// When get_samples() is called, the graph will traverse through each node, where each node will either place samples (if a generator node) or modify it (effect node)
-    pub struct AudioGraph<'a> {
-        nodes: Vec<Box<dyn AudioNode + 'a>>,
-        graph_map: NodeTree
+    pub struct AudioGraph {
+        nodes: Vec<Box<dyn AudioNode + 'static>>,
+        graph_map: NodeTree,
+        iter_stack: Vec<(usize, usize, usize)>,
+        iter_stack_size: usize
     }
 
 
-    impl<'a> AudioGraph<'a> {
-
+    impl AudioGraph {
         /// Create a new audio graph instance
-        pub fn new() -> AudioGraph<'a> {
+        pub fn new() -> AudioGraph {
             AudioGraph {
                 nodes: vec![Box::new(OutputNode::new())],
                 graph_map: NodeTree {
                     nodes: vec![MapNode {parent: None, children: vec![]}]
-                }
+                },
+                iter_stack: vec![(0, 0, 0)],
+                iter_stack_size: 0
             }
         }
 
         /// Add an AudioNode to the graph
         /// NOTE that calling this function will NOT establish any connections to other nodes.  It simply adds the node to the ownership list, nodes
         /// This function will return an identification number that the user can then use to reference the added node when making connections/disconnections
-        pub fn add_new_node(&mut self, n: Box<dyn AudioNode + 'a>) -> usize {
+        pub fn add_new_node(&mut self, n: Box<dyn AudioNode + 'static>) -> usize {
             self.nodes.push(n);
             self.graph_map.nodes.push(MapNode::new());
+            self.iter_stack.push((0, 0, 0));
 
             self.nodes.len() - 1
         }
@@ -201,6 +263,59 @@ pub mod AudioToolbox {
             }
 
             Ok(())
+        }
+
+        pub fn process_block<'a>(&mut self, buffer: &'a mut [f32]) -> &'a mut [f32] {
+            //  First initialize the stack used for graph traversal
+            self.go_to_branch_end(0);
+
+            while let Some(node) = self.next() {
+                // self.nodes[node].process_block(buffer);
+                println!("Node: {}", node);
+            }
+
+            buffer
+        }
+
+
+        //  Functions for iterating through the graph node
+        //  ==============================================================================================================  //
+        /// For a given node, go to the end of its branch and push the intermediate nodes onto the stack
+        fn go_to_branch_end(&mut self, node_id: usize) {
+            let mut current_id = node_id;
+            loop {
+                self.iter_stack[self.iter_stack_size] = (current_id, self.graph_map.nodes[current_id].children.len(), 0);
+                self.iter_stack_size += 1;
+
+                if self.graph_map.nodes[current_id].children.len() > 0 {
+                    current_id = self.graph_map.nodes[current_id].children[0];
+                } else {
+                    break;
+                }
+            }
+        }
+
+        /// Retrieve the next node id in the audio graph chain.  Will return None if the entire graph has been processed
+        fn next(&mut self) -> Option<usize> {
+            if self.iter_stack_size > 0 {
+                //  First, check to see if there are any unvisited children nodes in the current node
+                //  If there are, then traverse to the end of the branch and push the nodes along the way onto the stack
+                let (node_id, num_children, child_index) = self.iter_stack[self.iter_stack_size - 1];
+                if child_index + 1 < num_children {
+                    //  Mark child as visited
+                    self.iter_stack[self.iter_stack_size].2 = child_index + 1;
+
+                    let child_node_id = self.graph_map.nodes[node_id].children[child_index + 1];
+                    self.go_to_branch_end(child_node_id);
+                }
+
+                let next_node_id = self.iter_stack[self.iter_stack_size - 1].0;
+                self.iter_stack_size -= 1;
+
+                return Some(next_node_id);
+            }
+            
+            None
         }
 
         // pub fn get_node_mut(&mut self, id: usize) -> Option<&mut Node> {
@@ -350,5 +465,8 @@ mod tests {
             Err(e) => { println!("{}", e.message); },
             _ => { panic!(); }
         }
+
+        let mut buffer: [f32; 5] = [0.; 5];
+        graph.process_block(&mut buffer);
     }
 }
