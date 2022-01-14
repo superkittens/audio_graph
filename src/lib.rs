@@ -17,11 +17,13 @@ pub mod AudioToolbox {
         ConnectionAlreadyExists,
         InvalidBufferSize,
         InvalidSamplingFrequency,
-        AudioGraphNotPrepared
+        AudioGraphNotPrepared,
+        AudioGraphRunning
     }
 
     pub trait AudioNode {
-        /// Initialization function called by the audio graph instance
+        /// Do any initializations that need to be done for a given node (allocating space, sampling freq, coefficients etc).  
+        /// Called by the audio graph instance when calling `AudioGraph::prepare()`
         fn init(&mut self, audio_runtime_params: &AudioRuntimeParameters) {}
 
         /// Get type of node (generator, mixer, effect etc...)
@@ -36,6 +38,9 @@ pub mod AudioToolbox {
         /// Consume one input port for a given node.
         /// Called by graph when calling AudioGraph::connect_node().  
         fn connect_input(&mut self) {}
+
+        /// Increases the number of available inputs of a node after an attaching node is disconnected
+        fn disconnect_input(&mut self) {}
 
         /// Change parameters for a given node
         /// Parameters are packed into an array.  Each element maps to some parameter defined by the trait implementor
@@ -83,8 +88,14 @@ pub mod AudioToolbox {
         }
 
         fn connect_input(&mut self) {
-            if self.next_available_input <= self.num_inputs {
+            if self.next_available_input < self.num_inputs {
                 self.next_available_input += 1
+            }
+        }
+
+        fn disconnect_input(&mut self) {
+            if self.next_available_input > 0 {
+                self.next_available_input -= 1;
             }
         }
     }
@@ -196,7 +207,8 @@ pub mod AudioToolbox {
         graph_map: NodeTree,
         iter_stack: Vec<(usize, usize, usize)>,
         iter_stack_size: usize,
-        audio_runtime_params: AudioRuntimeParameters
+        audio_runtime_params: AudioRuntimeParameters,
+        graph_running: bool
     }
 
 
@@ -213,7 +225,8 @@ pub mod AudioToolbox {
                 audio_runtime_params: AudioRuntimeParameters {
                                             sampling_freq: 0.0,
                                             buffer_size: 0
-                }
+                },
+                graph_running: false
             }
         }
 
@@ -221,6 +234,13 @@ pub mod AudioToolbox {
         /// NOTE that calling this function will NOT establish any connections to other nodes.  It simply transfers ownership of the node to the graph.  
         /// This function will return an identification number that the user can then use to reference the added node when making connections/disconnections
         pub fn add_new_node(&mut self, n: Box<dyn AudioNode + 'static>) -> Result<usize, Error> {
+            if self.graph_running == true {
+                return Err( Error {
+                    code: ErrorCodes::AudioGraphRunning,
+                    message: String::from("Audio Graph is running!")
+                });
+            }
+
             match n.get_node_type() {
                 AudioNodeType::Output => { return Err(Error {
                     code: ErrorCodes::CannotAddOutputTypeNode,
@@ -240,9 +260,21 @@ pub mod AudioToolbox {
         /// Connect a node to the output node.  
         /// Note that the output node can only have one child.
         pub fn connect_node_to_output(&mut self, node_out_id: usize) -> Result<(), Error> {
+            if self.graph_running == true {
+                return Err( Error {
+                    code: ErrorCodes::AudioGraphRunning,
+                    message: String::from("Audio Graph is running!")
+                });
+            }
+
             match self.nodes[0].get_next_available_input() {
-                Some(i) => self.connect_node(node_out_id, 0, i),
-                None => Err(Error {
+                Some(_) => {
+                    self.graph_map.nodes[0].children.push(node_out_id);
+                    self.nodes[0].connect_input();
+
+                    return Ok(());
+                },
+                None => return Err(Error {
                                 code: ErrorCodes::NodeNoMoreInputs,
                                 message: String::from("Output node already has a connection to a child node")
                 })
@@ -254,6 +286,12 @@ pub mod AudioToolbox {
         /// 
         /// [node_out]->[node_in]
         pub fn connect_node(&mut self, node_out_id: usize, node_in_id: usize, node_in_input_port: usize) -> Result<(), Error> {
+            if self.graph_running == true {
+                return Err( Error {
+                    code: ErrorCodes::AudioGraphRunning,
+                    message: String::from("Audio Graph is running!")
+                });
+            }
 
             let validation_result = self.validate_node_inputs(node_out_id, node_in_id, node_in_input_port);
             match validation_result {
@@ -281,10 +319,67 @@ pub mod AudioToolbox {
             Ok(())
         }
 
+        pub fn disconnect_node_from_output(&mut self, node_out_id: usize) {
+            if self.graph_running == true {
+                return;
+            }
+
+            if self.check_node_exists(&node_out_id) == false {
+                return;
+            }
+
+            //  Ensure that the node is connected to the output node
+            if self.graph_map.nodes[node_out_id].parent != Some(0) {
+                return;
+            }
+
+            //  Remove connections
+            self.graph_map.nodes[0].children.pop();
+            self.graph_map.nodes[node_out_id].parent = None;
+
+            self.nodes[0].disconnect_input();
+        }
+
+        /// Remove connections between two nodes
+        pub fn disconnect_node(&mut self, node_out_id: usize, node_in_id: usize) {
+            if self.graph_running == true {
+                return;
+            }
+
+            //  Make sure nodes actually exist
+            if self.check_node_exists(&node_out_id) == false || self.check_node_exists(&node_in_id) == false {
+                return;
+            }
+
+            //  Ensure that the connection between the two nodes actually exist
+            if self.graph_map.nodes[node_out_id].parent != Some(node_in_id) {
+                return;
+            }
+
+            //  Remove connections
+            for i in 0..self.graph_map.nodes[node_in_id].children.len() {
+                if i == node_out_id {
+                    self.graph_map.nodes[node_in_id].children.remove(i);
+                }
+            }
+
+            self.graph_map.nodes[node_out_id].parent = None;
+            self.nodes[node_in_id].disconnect_input();
+        }
+
+        /// Get a reference to a node in the audio graph
+        pub fn get_node(&self, node_id: usize) -> Option<&Box<dyn AudioNode>> {
+            if self.check_node_exists(&node_id) == false {
+                return None;
+            }
+
+            Some(&self.nodes[node_id])
+        }
+
         /// Ensures that connecting nodes are valid and do not already have connections between them
         fn validate_node_inputs(&self, node_out_id: usize, node_in_id: usize, node_in_input_port: usize) -> Result<(), Error> {
             //  Make sure node actually exists in graph
-            if node_in_id > self.nodes.len() || node_out_id > self.nodes.len() {
+            if self.check_node_exists(&node_in_id) == false || self.check_node_exists(&node_out_id) == false {
                 return Err(Error{
                     code: ErrorCodes::NodeIDNonExistent,
                     message: String::from("Node ID does not exist in graph")
@@ -328,10 +423,25 @@ pub mod AudioToolbox {
             Ok(())
         }
 
+        fn check_node_exists(&self, node_id: &usize) -> bool {
+            if *node_id > self.nodes.len() {
+                return false;
+            }
+
+            true
+        }
+
         /// Prepare the audio graph with a specified set of audio runtime parameters (sampling freq, buffer size etc).  
         /// This function will call the initialization functions for all of the nodes.  
         /// This function only needs to be called once.
         pub fn prepare(&mut self, audio_parameters: AudioRuntimeParameters) -> Result<(), Error> {
+            if self.graph_running == true {
+                return Err( Error {
+                    code: ErrorCodes::AudioGraphRunning,
+                    message: String::from("Audio Graph is running!")
+                });
+            }
+
             //  Check that audio_parameters have valid inputs
             if audio_parameters.buffer_size == 0 {
                 return Err(Error {
@@ -353,6 +463,8 @@ pub mod AudioToolbox {
                 node.init(&self.audio_runtime_params);
             }
 
+            self.graph_running = true;
+
             Ok(())
         }
 
@@ -361,7 +473,7 @@ pub mod AudioToolbox {
         pub fn process_block<'a>(&mut self, buffer: &'a mut [f32]) -> Result<&'a mut [f32], Error> {
 
             //  Ensure that prepare() has been called once before calling process_block().
-            if self.audio_runtime_params.sampling_freq == 0.0 {
+            if self.graph_running == false {
                 return Err( Error {
                     code: ErrorCodes::AudioGraphNotPrepared,
                     message: String::from("Must call prepare() before attempting to get samples from the audio graph")
@@ -457,6 +569,12 @@ pub mod ModelNodes {
         fn connect_input(&mut self) {
             if self.next_available_input < self.num_inputs {
                 self.next_available_input += 1;
+            }
+        }
+
+        fn disconnect_input(&mut self) {
+            if self.next_available_input > 0 {
+                self.next_available_input -= 1;
             }
         }
     }
@@ -557,6 +675,12 @@ pub mod ModelNodes {
         fn connect_input(&mut self) {
             if self.next_available_input < self.num_inputs {
                 self.next_available_input += 1;
+            }
+        }
+
+        fn disconnect_input(&mut self) {
+            if self.next_available_input > 0 {
+                self.next_available_input -= 1;
             }
         }
 
@@ -678,9 +802,6 @@ mod tests {
             Err(e) => { println!("{}", e.message); panic!(); }
         }
 
-        // let id_n1 = graph.add_new_node(n1);
-        // let id_n2 = graph.add_new_node(n2).unwrap();
-
         //  Ensure node ids are as expected
         assert_eq!(id_n1, 1);
         assert_eq!(id_n2, 2);
@@ -700,10 +821,23 @@ mod tests {
             _ => {}
         }
 
+        //  Ensure an input port is used
+        let n1_ref = graph.get_node(id_n2);
+        match n1_ref {
+            Some(n) => { assert_eq!(n.get_next_available_input(), None); },
+            None => { panic!(); }
+        }
+
         let result = graph.connect_node_to_output(id_n2);
         match result {
             Err(e) => { println!("{}", e.message); panic!(); },
             _ => {}
+        }
+
+        let n0_ref = graph.get_node(0);
+        match n0_ref {
+            Some(n) => { assert_eq!(n.get_next_available_input(), None); },
+            None => { panic!(); }
         }
 
         //  Attempt to connect another node to the output (The output can only accept one child node!)
@@ -718,6 +852,14 @@ mod tests {
         match result {
             Err(e) => { println!("{}", e.message); },
             _ => { panic!(); }
+        }
+
+        //  Disconnect n1 from n2
+        graph.disconnect_node(id_n1, id_n2);
+        let n2_ref = graph.get_node(id_n2);
+        match n2_ref {
+            Some(n) => { assert_eq!(n.get_next_available_input(), Some(0)); },
+            None => { panic!(); }
         }
     }
 
@@ -783,6 +925,14 @@ mod tests {
             },
 
             Err(e) => { println!("{}", e.message); panic!(); }
+        }
+
+        //  Attempt to add a node to a graph while it is running
+        let bad_node = Box::new(ModelNodes::TestNode::new());
+        let result = graph.add_new_node(bad_node);
+        match result {
+            Ok(_) => { panic!(); },
+            Err(_) => {}
         }
     }
 }
