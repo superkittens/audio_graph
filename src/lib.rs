@@ -1,6 +1,6 @@
-
-
 pub mod AudioToolbox {
+//! # Audio Toolbox
+//! Module containing structures for audio such as audio graphs and the nodes that are inside them
 
     pub struct Error {
         pub code: ErrorCodes,
@@ -8,25 +8,42 @@ pub mod AudioToolbox {
     }
 
     pub enum ErrorCodes {
-        node_id_non_existent,
-        node_input_port_invalid,
-        node_no_more_inputs,
-        node_parent_already_exists,
-        node_connecting_to_itself,
-        output_node_has_no_inputs,
-        connection_already_exists,
-        invalid_buffer_size,
-        invalid_sampling_frequency
+        NodeIDNonExistent,
+        NodeInputPortInvalid,
+        NodeNoMoreInputs,
+        NodeParentAlreadyExists,
+        NodeConnectingToItself,
+        CannotAddOutputTypeNode,
+        ConnectionAlreadyExists,
+        InvalidBufferSize,
+        InvalidSamplingFrequency
     }
 
     pub trait AudioNode {
+        /// Initialization function called by the audio graph instance
         fn init(&mut self, audio_runtime_params: &AudioRuntimeParameters) {}
+
+        /// Get type of node (generator, mixer, effect etc...)
         fn get_node_type(&self) -> &AudioNodeType;
+
+        /// Get total number of inputs for a given node
         fn get_number_of_inputs(&self) -> usize;
+
+        /// Get the next free input port number for a given node
         fn get_next_available_input(&self) -> Option<usize>;
+
+        /// Consume one input port for a given node.
+        /// Called by graph when calling AudioGraph::connect_node().  
         fn connect_input(&mut self) {}
+
+        /// Change parameters for a given node
+        /// Parameters are packed into an array.  Each element maps to some parameter defined by the trait implementor
         fn change_parameters<'a>(&mut self, parameters: &'a [f32]) {}
+
+        /// Reset state of node
         fn reset(&mut self) {}
+
+        /// Get samples from a given node
         fn process_block<'a>(&mut self, buffer: &'a mut [f32]) -> &'a mut [f32] { buffer }
     }
 
@@ -82,9 +99,8 @@ pub mod AudioToolbox {
     }
 
     
-    /// Audio Runtime Parameters
-    /// This struct carries information about audio playback settings such as sampling frequency and buffer size
-    /// An instance of this struct is passed to AudioGraph::prepare() before the audio graph is run (if not, default parameters are used)
+    /// This struct carries information about audio playback settings such as sampling frequency and buffer size.  
+    /// An instance of this struct is passed to AudioGraph::prepare() before the audio graph is run.
     pub struct AudioRuntimeParameters {
         pub sampling_freq: f32,
         pub buffer_size: usize,
@@ -117,10 +133,57 @@ pub mod AudioToolbox {
 
 
 
-    /// Audio Graph
-    /// An audio graph is responsible for creating and modifying audio samples that eventually are written to some output buffer
-    /// Sample creation and modification is handled by the individual nodes 
-    /// When get_samples() is called, the graph will traverse through each node, where each node will either place samples (if a generator node) or modify it (effect node)
+    /// A structure that holds audio nodes and obtains audio samples from them via calls to `process_block()`
+    /// Nodes are created by the user and registered into the graph using `add_new_node()`.  
+    /// 
+    /// ## Example Routine
+    /// 
+    /// ```
+    /// use audio_graph::AudioToolbox::{AudioGraph, AudioRuntimeParameters};
+    /// use audio_graph::ModelNodes::*;
+    /// 
+    /// let mut graph = AudioGraph::new();
+    /// 
+    /// let n1 = Box::new(TestGenNode::new());
+    /// let n2 = Box::new(TestFXNode::new());
+    /// 
+    /// //  Add nodes to graph and get their ids
+    /// let mut n1_id: usize = 0;
+    /// let mut n2_id: usize = 0;
+    /// 
+    /// match graph.add_new_node(n1) {
+    ///     Ok(i) => {n1_id = i;},
+    ///     Err(e) => {}
+    /// }
+    /// 
+    /// match graph.add_new_node(n2) {
+    ///     Ok(i) => {n2_id = i;},
+    ///     Err(e) => {}
+    /// }
+    /// 
+    /// //  Establish connections between nodes
+    /// graph.connect_node(n1_id, n2_id, 0);
+    /// graph.connect_node_to_output(n2_id);
+    /// 
+    /// //  Create AudioRuntimeParameters
+    /// let runtime_params = AudioRuntimeParameters {
+    ///     sampling_freq: 44_100.0,
+    ///     buffer_size: 512
+    /// };
+    /// 
+    /// //  Prepare graph for operation
+    /// match graph.prepare(runtime_params) {
+    ///     Ok(()) => {
+    ///         //  Get samples from graph
+    ///         let mut buffer = [0.0; 512];
+    ///         
+    ///         //  process_block() would be called in a callback, loop etc
+    ///         graph.process_block(&mut buffer);
+    ///     },
+    ///     Err(e) => {}
+    /// }
+    /// 
+    /// ```
     pub struct AudioGraph {
         nodes: Vec<Box<dyn AudioNode + 'static>>,
         graph_map: NodeTree,
@@ -147,12 +210,16 @@ pub mod AudioToolbox {
             }
         }
 
-        /// Add an AudioNode to the graph
-        /// NOTE that calling this function will NOT establish any connections to other nodes.  It simply adds the node to the ownership list, nodes
+        /// Add an AudioNode to the graph.  
+        /// NOTE that calling this function will NOT establish any connections to other nodes.  It simply transfers ownership of the node to the graph.  
         /// This function will return an identification number that the user can then use to reference the added node when making connections/disconnections
-        pub fn add_new_node(&mut self, n: Box<dyn AudioNode + 'static>) -> Option<usize> {
+        pub fn add_new_node(&mut self, n: Box<dyn AudioNode + 'static>) -> Result<usize, Error> {
             match n.get_node_type() {
-                AudioNodeType::Output => { return None; },
+                AudioNodeType::Output => { return Err(Error {
+                    code: ErrorCodes::CannotAddOutputTypeNode,
+                    message: String::from("Cannot add output type node to graph")
+                }); },
+
                 _ => {}
             }
             
@@ -160,22 +227,23 @@ pub mod AudioToolbox {
             self.graph_map.nodes.push(MapNode::new());
             self.iter_stack.push((0, 0, 0));
 
-            Some(self.nodes.len() - 1)
+            Ok(self.nodes.len() - 1)
         }
 
+        /// Connect a node to the output node.  
+        /// Note that the output node can only have one child.
         pub fn connect_node_to_output(&mut self, node_out_id: usize) -> Result<(), Error> {
             match self.nodes[0].get_next_available_input() {
                 Some(i) => self.connect_node(node_out_id, 0, i),
                 None => Err(Error {
-                                code: ErrorCodes::output_node_has_no_inputs,
+                                code: ErrorCodes::NodeNoMoreInputs,
                                 message: String::from("Output node already has a connection to a child node")
                 })
             }
         }
 
-        /// Connect two nodes together
-        /// The output of node1 is connected to the input of node2
-        /// Specify which input of node_in that the output of node_out will be connected to
+        /// Connect two nodes together.  
+        /// The output of node1 is connected to the input port of node2:
         /// 
         /// [node_out]->[node_in]
         pub fn connect_node(&mut self, node_out_id: usize, node_in_id: usize, node_in_input_port: usize) -> Result<(), Error> {
@@ -195,7 +263,7 @@ pub mod AudioToolbox {
                         }
 
                         Some(_i) => {return Err(Error {
-                                        code: ErrorCodes::node_parent_already_exists,
+                                        code: ErrorCodes::NodeParentAlreadyExists,
                                         message: String::from("node_out already has a parent: ")
                                     });
                                     }
@@ -206,11 +274,12 @@ pub mod AudioToolbox {
             Ok(())
         }
 
+        /// Ensures that connecting nodes are valid and do not already have connections between them
         fn validate_node_inputs(&self, node_out_id: usize, node_in_id: usize, node_in_input_port: usize) -> Result<(), Error> {
             //  Make sure node actually exists in graph
             if node_in_id > self.nodes.len() || node_out_id > self.nodes.len() {
                 return Err(Error{
-                    code: ErrorCodes::node_id_non_existent,
+                    code: ErrorCodes::NodeIDNonExistent,
                     message: String::from("Node ID does not exist in graph")
                 });
             }
@@ -218,7 +287,7 @@ pub mod AudioToolbox {
             //  Ensure that a valid input port is passed in
             if node_in_input_port >= self.nodes[node_in_id].get_number_of_inputs() {
                 return Err(Error {
-                    code: ErrorCodes::node_input_port_invalid,
+                    code: ErrorCodes::NodeInputPortInvalid,
                     message: String::from("Node input port not valid")
                 });
             }
@@ -226,7 +295,7 @@ pub mod AudioToolbox {
             //  Ensure that unconnected inputs are actually available
             if self.nodes[node_in_id].get_next_available_input() == None {
                 return Err(Error {
-                    code: ErrorCodes::node_no_more_inputs,
+                    code: ErrorCodes::NodeNoMoreInputs,
                     message: String::from("Input node has no more available inputs")
                 });
             }
@@ -234,7 +303,7 @@ pub mod AudioToolbox {
             //  Ensure that a node is not being connected to itself
             if node_out_id == node_in_id {
                 return Err(Error {
-                    code: ErrorCodes::node_connecting_to_itself,
+                    code: ErrorCodes::NodeConnectingToItself,
                     message: String::from("Cannot connect a node to itself")
                 });
             }
@@ -243,7 +312,7 @@ pub mod AudioToolbox {
             for child in &self.graph_map.nodes[node_out_id].children {
                 if *child == node_in_id {
                     return Err( Error {
-                        code: ErrorCodes::connection_already_exists,
+                        code: ErrorCodes::ConnectionAlreadyExists,
                         message: String::from("The node connection already exists")
                     });
                 }
@@ -252,20 +321,21 @@ pub mod AudioToolbox {
             Ok(())
         }
 
-        /// Prepare the audio graph with a specified set of audio runtime parameters (sampling freq, buffer size etc)
-        /// This function will call the initialization functions for all of the nodes
+        /// Prepare the audio graph with a specified set of audio runtime parameters (sampling freq, buffer size etc).  
+        /// This function will call the initialization functions for all of the nodes.  
+        /// This function only needs to be called once.
         pub fn prepare(&mut self, audio_parameters: AudioRuntimeParameters) -> Result<(), Error> {
             //  Check that audio_parameters have valid inputs
             if audio_parameters.buffer_size == 0 {
                 return Err(Error {
-                    code: ErrorCodes::invalid_buffer_size,
+                    code: ErrorCodes::InvalidBufferSize,
                     message: String::from("Invalid buffer size")
                 });
             }
 
             if audio_parameters.sampling_freq <= 0.0 {
                 return Err( Error {
-                    code: ErrorCodes::invalid_sampling_frequency,
+                    code: ErrorCodes::InvalidSamplingFrequency,
                     message: String::from("Invalid sampling frequency entered")
                 });
             }
@@ -279,7 +349,8 @@ pub mod AudioToolbox {
             Ok(())
         }
 
-        /// Run the audio graph and get a buffer of samples
+        /// Run the audio graph and get a buffer of samples.  
+        /// The audio graph performs a depth-first traversal when obtaining samples from nodes.
         pub fn process_block<'a>(&mut self, buffer: &'a mut [f32]) -> &'a mut [f32] {
             //  First initialize the stack used for graph traversal
             self.go_to_branch_end(0);
@@ -336,11 +407,14 @@ pub mod AudioToolbox {
 }
 
 
-mod TestNodes {
+pub mod ModelNodes {
+//! Model nodes that may be used as references when implementing custom nodes
+
     use super::AudioToolbox::{AudioNodeType, AudioNode, AudioRuntimeParameters};
 
+    /// Generic node.  Does nothing special.
+    /// The struct fields demonstrate the bare minimum information that such a struct must have
     pub struct TestNode {
-        data: i32,
         node_type: AudioNodeType,
         num_inputs: usize,
         inputs: [i32; 1],
@@ -348,7 +422,6 @@ mod TestNodes {
     }
 
     impl AudioNode for TestNode {
-
         fn get_node_type(&self) -> &AudioNodeType {
             &self.node_type
         }
@@ -370,20 +443,11 @@ mod TestNodes {
                 self.next_available_input += 1;
             }
         }
-
-        fn reset(&mut self) {
-            self.data = 88;
-        }
-
-        fn process_block<'a>(&mut self, buffer: &'a mut [f32]) -> &'a mut [f32] {
-            buffer
-        }
     }
 
     impl TestNode {
         pub fn new() -> TestNode {
             TestNode {
-                data: 88,
                 node_type: AudioNodeType::Test,
                 num_inputs: 1,
                 inputs: [-1; 1],
@@ -393,6 +457,8 @@ mod TestNodes {
     }
 
 
+    /// Model Generator node.  
+    /// A generator node may or may not have inputs
     pub struct TestGenNode {
         node_type: AudioNodeType,
         audio_runtime_params: AudioRuntimeParameters
@@ -440,6 +506,7 @@ mod TestNodes {
         }
     }
 
+    /// Model Effects Node
     pub struct TestFXNode {
         node_type: AudioNodeType,
         inputs: [i32; 1],
@@ -504,7 +571,8 @@ mod TestNodes {
     }
 
 
-    //  Test output node.  The audio graph should reject any attempts to add output node types into the graph
+    ///  Test output node.  **DO NOT USE.  FOR UNIT TESTING PURPOSES ONLY**
+    ///  The audio graph should reject any attempts to add output node types into the graph
     pub struct TestOutputNode {
         node_type: AudioNodeType
     }
@@ -530,25 +598,33 @@ mod TestNodes {
             }
         }
     }
-
 }
 
 
 
 mod tests {
-    use super::{AudioToolbox, TestNodes};
+    use super::{AudioToolbox, ModelNodes};
 
     #[test]
     fn add_node_to_graph() {
         let mut graph = AudioToolbox::AudioGraph::new();
-        let node = Box::new(TestNodes::TestNode::new());
-        let id = graph.add_new_node(node).unwrap();
+        let node = Box::new(ModelNodes::TestNode::new());
+
+        let id: usize;
+        match graph.add_new_node(node) {
+            Ok(i) => { id = i; }
+            Err(e) => { panic!(); }
+        }
 
         //  The id of the first node should always be 1 (since 0 is reserved for the output)
         assert_eq!(id, 1);
 
-        let another_node = Box::new(TestNodes::TestNode::new());
-        let id_another_node = graph.add_new_node(another_node).unwrap();
+        let another_node = Box::new(ModelNodes::TestNode::new());
+        let id_another_node: usize;
+        match graph.add_new_node(another_node) {
+            Ok(i) => {id_another_node = i; }
+            Err(e) => { panic!(); }
+        }
 
         assert_eq!(id_another_node, 2);
     }
@@ -556,8 +632,8 @@ mod tests {
     #[test]
     fn connect_nodes_in_graph() {
         let mut graph = AudioToolbox::AudioGraph::new();
-        let n1 = Box::new(TestNodes::TestNode::new());
-        let n2 = Box::new(TestNodes::TestNode::new());
+        let n1 = Box::new(ModelNodes::TestNode::new());
+        let n2 = Box::new(ModelNodes::TestNode::new());
 
         //  Attempt to connect non-existent nodes
         let result = graph.connect_node(1, 2, 0);
@@ -567,15 +643,27 @@ mod tests {
         }
 
         //  Attempt to add a node of type Output
-        let n0 = Box::new(TestNodes::TestOutputNode::new());
-        let result = graph.add_new_node(n0);
-        match result {
-            None => {},
-            _ => { panic!(); }
+        let n0 = Box::new(ModelNodes::TestOutputNode::new());
+        match graph.add_new_node(n0) {
+            Err(e) => {},
+            Ok(i) => { panic!(); }
         }
 
-        let id_n1 = graph.add_new_node(n1).unwrap();
-        let id_n2 = graph.add_new_node(n2).unwrap();
+        let id_n1: usize;
+        let id_n2: usize;
+
+        match graph.add_new_node(n1) {
+            Ok(i) => id_n1 = i,
+            Err(e) => { println!("{}", e.message); panic!(); }
+        }
+
+        match graph.add_new_node(n2) {
+            Ok(i) => id_n2 = i,
+            Err(e) => { println!("{}", e.message); panic!(); }
+        }
+
+        // let id_n1 = graph.add_new_node(n1);
+        // let id_n2 = graph.add_new_node(n2).unwrap();
 
         //  Ensure node ids are as expected
         assert_eq!(id_n1, 1);
@@ -621,11 +709,21 @@ mod tests {
     fn run_audio_graph() {
         //  Here, a simple audio graph is made and run.  The expected output is [0.5, 0.5, 0.5, 0.5]
         let mut graph = AudioToolbox::AudioGraph::new();
-        let n1 = Box::new(TestNodes::TestGenNode::new());
-        let n2 = Box::new(TestNodes::TestFXNode::new());
+        let n1 = Box::new(ModelNodes::TestGenNode::new());
+        let n2 = Box::new(ModelNodes::TestFXNode::new());
 
-        let n1_id = graph.add_new_node(n1).unwrap();
-        let n2_id = graph.add_new_node(n2).unwrap();
+        let n1_id: usize;
+        let n2_id: usize;
+
+        match graph.add_new_node(n1) {
+            Ok(i) => n1_id = i,
+            Err(e) => { println!("{}", e.message); panic!(); }
+        }
+
+        match graph.add_new_node(n2) {
+            Ok(i) => n2_id = i,
+            Err(e) => { println!("{}", e.message); panic!(); }
+        }
 
         let result = graph.connect_node(n1_id, n2_id, 0);
         match result {
@@ -643,6 +741,9 @@ mod tests {
             sampling_freq: 44_100.0,
             buffer_size: 4
         };
+
+        //  Attempt to run the audio graph without calling prepare() first
+        
 
         let result = graph.prepare(runtime_params);
         match result {
