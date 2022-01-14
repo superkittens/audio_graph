@@ -16,7 +16,8 @@ pub mod AudioToolbox {
         CannotAddOutputTypeNode,
         ConnectionAlreadyExists,
         InvalidBufferSize,
-        InvalidSamplingFrequency
+        InvalidSamplingFrequency,
+        AudioGraphNotPrepared
     }
 
     pub trait AudioNode {
@@ -144,6 +145,8 @@ pub mod AudioToolbox {
     /// 
     /// let mut graph = AudioGraph::new();
     /// 
+    /// //  Create a generator node and test node.  Connections will look like this:
+    /// //  [n1] -> [n2] -> [Output]
     /// let n1 = Box::new(TestGenNode::new());
     /// let n2 = Box::new(TestFXNode::new());
     /// 
@@ -178,7 +181,11 @@ pub mod AudioToolbox {
     ///         let mut buffer = [0.0; 512];
     ///         
     ///         //  process_block() would be called in a callback, loop etc
-    ///         graph.process_block(&mut buffer);
+    ///         let result = graph.process_block(&mut buffer);
+    ///         match result {
+    ///             Ok(buf) => {},
+    ///             Err(e) => {}
+    ///         }
     ///     },
     ///     Err(e) => {}
     /// }
@@ -204,8 +211,8 @@ pub mod AudioToolbox {
                 iter_stack: vec![(0, 0, 0)],
                 iter_stack_size: 0,
                 audio_runtime_params: AudioRuntimeParameters {
-                                            sampling_freq: 44_100.0,
-                                            buffer_size: 512
+                                            sampling_freq: 0.0,
+                                            buffer_size: 0
                 }
             }
         }
@@ -351,7 +358,16 @@ pub mod AudioToolbox {
 
         /// Run the audio graph and get a buffer of samples.  
         /// The audio graph performs a depth-first traversal when obtaining samples from nodes.
-        pub fn process_block<'a>(&mut self, buffer: &'a mut [f32]) -> &'a mut [f32] {
+        pub fn process_block<'a>(&mut self, buffer: &'a mut [f32]) -> Result<&'a mut [f32], Error> {
+
+            //  Ensure that prepare() has been called once before calling process_block().
+            if self.audio_runtime_params.sampling_freq == 0.0 {
+                return Err( Error {
+                    code: ErrorCodes::AudioGraphNotPrepared,
+                    message: String::from("Must call prepare() before attempting to get samples from the audio graph")
+                })
+            }
+
             //  First initialize the stack used for graph traversal
             self.go_to_branch_end(0);
 
@@ -360,7 +376,7 @@ pub mod AudioToolbox {
                 println!("Node: {}", node); //  For debugging
             }
 
-            buffer
+            Ok(buffer)
         }
 
 
@@ -737,12 +753,18 @@ mod tests {
             _ => {}
         }
 
+        //  Attempt to get samples from the graph before calling prepare()
+        let mut buffer = [0.0; 4];
+        let result = graph.process_block(&mut buffer);
+        match result {
+            Ok(buf) => { panic!(); },
+            Err(e) => {}
+        }
+
         let runtime_params = AudioToolbox::AudioRuntimeParameters {
             sampling_freq: 44_100.0,
             buffer_size: 4
         };
-
-        //  Attempt to run the audio graph without calling prepare() first
         
 
         let result = graph.prepare(runtime_params);
@@ -751,12 +773,16 @@ mod tests {
             _ => {}
         }
 
-        let mut buffer = [0.0; 4];
-        graph.process_block(&mut buffer);
+        let result = graph.process_block(&mut buffer);
+        match result {
+            Ok(buffer) => {
+                assert_eq!(buffer[0], 0.5);
+                assert_eq!(buffer[1], 0.5);
+                assert_eq!(buffer[2], 0.5);
+                assert_eq!(buffer[3], 0.5);
+            },
 
-        assert_eq!(buffer[0], 0.5);
-        assert_eq!(buffer[1], 0.5);
-        assert_eq!(buffer[2], 0.5);
-        assert_eq!(buffer[3], 0.5);
+            Err(e) => { println!("{}", e.message); panic!(); }
+        }
     }
 }
